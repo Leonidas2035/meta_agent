@@ -1,11 +1,24 @@
-- name: data_pipeline
+- name: stage_1_data_pipeline
   prompt: prompts/stage_1_data_pipeline.md
-
-- name: online_features
-  prompt: prompts/stage_2_online_features.md
-
-- name: ml_training
-  prompt: prompts/stage_3_ml_training.md
-
-- name: risk_engine
-  prompt: prompts/stage_4_risk_engine.md
+- name: stage_2_feature_engine
+  prompt: prompts/stage_2_feature_engine.md
+- name: stage_3_ml_engine
+  prompt: prompts/stage_3_ml_engine.md
+- name: stage_4_signal_model
+  prompt: prompts/stage_4_signal_model.md
+- name: stage_5_paper_trading
+  prompt: prompts/stage_5_paper_trading.md
+- name: stage_6_llm_risk_layer
+  prompt: prompts/stage_6_llm_risk_layer.md
+- name: stage_7_live_trading
+  prompt: prompts/stage_7_live_trading.md
+- name: stage_8_backtester
+  prompt: prompts/stage_8_backtester.md
+- name: stage_9_monitoring_alerts
+  prompt: prompts/stage_9_monitoring_alerts.md
+- name: stage_10_security_hardening
+  prompt: prompts/stage_10_security_hardening.md
+- name: stage_11_gui_launcher
+  prompt: prompts/stage_11_gui_launcher.md
+- name: stage_12_installer
+  prompt: prompts/stage_12_installer.md

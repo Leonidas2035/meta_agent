@@ -19,3 +19,5 @@ class CodexClient:
             temperature=0
         )
         return response.choices[0].message.content
+from dotenv import load_dotenv
+load_dotenv()
