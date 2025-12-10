@@ -1,21 +1,29 @@
 class PromptBuilder:
-    HEADER = """
-ТИ — GPT-5.1-Codex, експерт з Python, ML, HFT, торгових систем.
-Пиши ПОВНІ файли у форматі:
+    HEADER = (
+        "You are Codex running inside Meta-Agent. "
+        "Follow the task instructions strictly. "
+        "Return files using the exact format below:\n"
+        "===FILE: relative/or/absolute/path===\n"
+        "<file content>\n"
+        "Only include files that should be written.\n"
+    )
 
-===FILE: path/to/file===
-<код>
+    def build_prompt(self, stage_instructions: str, project_context: str = "", metadata: dict | None = None) -> str:
+        sections = [self.HEADER]
 
-Ніколи не скорочуй код.
-Не додавай пояснень поза файлами.
-"""
+        if metadata:
+            meta_lines = "\n".join(f"{key}: {value}" for key, value in metadata.items())
+            sections.append("# Task Metadata\n" + meta_lines)
 
-    def build_prompt(self, stage_instructions: str, project_context: str) -> str:
-        return (
-            self.HEADER +
-            "\n# Вимоги етапу:\n" +
-            stage_instructions +
-            "\n# Існуючий код проєкту:\n" +
-            project_context +
-            "\n# Згенеруй нові або оновлені файли нижче:\n"
+        sections.append("# Task Instructions\n" + stage_instructions.strip())
+
+        if project_context:
+            sections.append("# Project Context\n" + project_context.strip())
+
+        sections.append(
+            "# Output Guidance\n"
+            "Use the ===FILE: path=== blocks for any files to create or update. "
+            "Avoid extra commentary outside those blocks unless specifically requested."
         )
+
+        return "\n\n".join(sections) + "\n"

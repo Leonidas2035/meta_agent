@@ -1,0 +1,6 @@
+{
+  "model": "gpt-5.1-code-large",
+  "temperature": 0,
+  "max_tokens": 8000,
+  "seed": 1
+}

@@ -1,0 +1,1 @@
+[ERROR] CodexClient failed: Error code: 400 - {'error': {'message': 'something went wrong reading your request', 'type': 'invalid_request_error', 'param': None, 'code': None}}
