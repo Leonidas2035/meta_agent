@@ -1,3 +1,4 @@
-
-- name: 'Stage 1: Supervisor-ready Meta-Agent core'
-  prompt: prompts/stage_03_Stage_1_Supervisor-ready_Meta-Agent_core.md
+- name: multiple projects
+  prompt: prompts/stage_01_multiple_projects.md
+- name: Meta-Agent audit & technical docs
+  prompt: prompts/stage_02_Meta-Agent_audit_&_technical_docs.md

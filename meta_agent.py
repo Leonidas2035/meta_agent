@@ -1,28 +1,35 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 from typing import Dict, Tuple
 
 import yaml
 
 from codex_client import CodexClient
-from env_crypto import encrypt_env
 from file_manager import FileManager
-from meta_core import TASKS_DIR, run_task
+from meta_core import run_task
+from paths import (
+    BASE_DIR,
+    OUTPUT_DIR,
+    PROMPTS_ARCHIVE_DIR,
+    PROMPTS_DIR,
+    REPORTS_DIR,
+    STAGES_PATH,
+    TASKS_DIR,
+)
 from project_scanner import ProjectScanner
+from projects_config import load_project_registry, resolve_project_root
 from prompt_builder import PromptBuilder
 from supervisor_runner import run_supervisor_cycle
-from task_archiver import (
-    archive_completed_tasks,
-    archive_stage_prompts,
-    archive_task_file,
-)
+from task_archiver import archive_task_file
 from task_manager import list_tasks
 
 FRONT_MATTER_DELIMITER = "---"
 ALLOWED_MODES = {"readonly", "write_dev", "write_prod"}
 DEFAULT_TASK_FILE = os.path.join(TASKS_DIR, "task_current.md")
+MAX_CONTEXT_CHARS = 250_000
 
 
 def load_task_from_file(path: str) -> Tuple[Dict, str]:
@@ -58,7 +65,9 @@ class MetaAgent:
     def __init__(self, config_path: str = "config.json"):
         self.config = self._load_config(config_path)
         self.builder = PromptBuilder()
-        self.client = CodexClient()
+        self.mode = self._resolve_mode()
+        self.client = CodexClient(mode=self.mode)
+        self.project_registry = load_project_registry()
 
     def _load_config(self, path: str) -> Dict:
         if not os.path.exists(path):
@@ -69,11 +78,17 @@ class MetaAgent:
         except (json.JSONDecodeError, OSError):
             return {}
 
-    def _normalize_mode(self, mode: str) -> str:
-        if mode in ALLOWED_MODES:
-            return mode
-        print(f"[WARN] Unsupported mode '{mode}', defaulting to readonly.")
-        return "readonly"
+    def _resolve_mode(self) -> str:
+        """
+        Determines execution mode (dev/prod) based on env or config.
+        """
+        env_mode = os.getenv("META_AGENT_MODE")
+        cfg_mode = (self.config or {}).get("mode")
+        mode = (env_mode or cfg_mode or "dev").strip().lower()
+        if mode not in {"dev", "prod"}:
+            print(f"[WARN] Unsupported mode '{mode}', defaulting to dev.")
+            mode = "dev"
+        return mode
 
     def _resolve_output_path(self, output_path: str | None, task_id: str) -> str:
         if output_path:
@@ -94,7 +109,7 @@ class MetaAgent:
 
         return dest
 
-    def _load_stages(self, path: str = "stages.yaml"):
+    def _load_stages(self, path: str = STAGES_PATH):
         if not os.path.exists(path):
             print(f"[ERROR] stages file not found: {path}")
             return []
@@ -105,20 +120,32 @@ class MetaAgent:
             print(f"[ERROR] Failed to parse stages file: {exc}")
             return []
 
-    def run_stage_pipeline(self) -> bool:
+    def run_stage_pipeline(self) -> tuple[bool, list]:
         print("[INFO] Starting stage pipeline from stages.yaml...")
         stages = self._load_stages()
         if not stages:
             print("[WARN] No stages to run.")
-            return False
+            return False, []
 
-        target_project = self.config.get("project_root") or "."
+        default_project_id = self.project_registry.default_project_id
+        file_manager = FileManager(base_output_dir=OUTPUT_DIR, target_project=None, mode="readonly")
         for stage in stages:
             name = stage.get("name", "unnamed_stage")
             prompt_file = stage.get("prompt")
             if not prompt_file:
                 print(f"[ERROR] Stage {name} is missing a prompt path.")
-                return False
+                return False, stages
+
+            project_id = stage.get("project") or default_project_id
+            try:
+                project_info = resolve_project_root(project_id, self.project_registry)
+            except KeyError as exc:
+                print(f"[ERROR] {exc}")
+                return False, stages
+            target_project = project_info.root_path
+            if not os.path.isdir(target_project):
+                print(f"[ERROR] Target project path does not exist for project_id={project_id}: {target_project}")
+                return False, stages
 
             resolved_prompt = os.path.abspath(prompt_file)
             if not os.path.exists(resolved_prompt):
@@ -127,21 +154,30 @@ class MetaAgent:
                     resolved_prompt = alternative
                 else:
                     print(f"[ERROR] Prompt file not found for stage {name}: {prompt_file}")
-                    return False
+                    return False, stages
 
             print(f"[INFO] Running stage: {name} using {prompt_file}")
             try:
                 with open(resolved_prompt, "r", encoding="utf-8") as handle:
                     stage_instructions = handle.read()
 
-                print(f"[INFO] Collecting project context from {target_project} for stage {name}...")
-                context = ProjectScanner(target_project).collect_project_files()
-                print(f"[INFO] Collected project context for stage {name} ({len(context)} chars).")
+                print(f"[INFO] Collecting project context from {target_project} for stage {name} (project_id={project_id})...")
+                scanner = ProjectScanner(target_project)
+                context = scanner.collect_project_context(max_chars=MAX_CONTEXT_CHARS)
+                print(
+                    f"[INFO] Collected context for stage {name}: "
+                    f"{scanner.stats.files_included} files, {scanner.stats.chars_collected} chars."
+                )
 
                 full_prompt = self.builder.build_prompt(
                     stage_instructions,
                     context,
-                    {"stage": name, "mode": "legacy", "target_project": target_project},
+                    {
+                        "stage": name,
+                        "mode": "legacy",
+                        "target_project": target_project,
+                        "project_id": project_id,
+                    },
                 )
 
                 print(f"[INFO] Sending prompt to Codex for stage {name}...")
@@ -150,22 +186,15 @@ class MetaAgent:
 
                 if isinstance(response, str) and response.lstrip().startswith("[ERROR]"):
                     print(f"[ERROR] Codex call failed for stage {name}: {response}")
-                    return False
+                    return False, stages
 
-                FileManager().process_output(response)
+                file_manager.process_output(response)
                 print(f"[INFO] Stage {name} completed.")
             except Exception as exc:
                 print(f"[ERROR] Stage {name} failed: {exc}")
-                return False
+                return False, stages
 
-        try:
-            print("[INFO] Archiving stage prompts...")
-            archive_stage_prompts(stages, target_project=target_project)
-            print("[INFO] Archived stage prompts and cleared stages.yaml.")
-        except Exception as exc:
-            print(f"[WARN] Archiving of stage prompts failed: {exc}")
-
-        return True
+        return True, stages
 
     def run_task_file(self, task_path: str) -> bool:
         """
@@ -205,22 +234,64 @@ def parse_args():
     parser.add_argument("--project", dest="filter_project", help="Filter tasks by project when listing.")
     parser.add_argument("--task-type", dest="filter_task_type", help="Filter tasks by task type when listing.")
     parser.add_argument("--supervisor-goal", dest="supervisor_goal", help="Run a supervisor goal (high-level string).")
+    parser.add_argument("--supervisor-project", dest="supervisor_project", help="Project root for supervisor goal runs.", default="ai_scalper_bot")
     parser.add_argument("--once", action="store_true", help="Run once and exit (default behavior).")
-    parser.add_argument("--encrypt-env", action="store_true", help="Encrypt .env into .env.enc using password 1111.")
     return parser.parse_args()
+
+
+def cleanup_after_successful_run(stages: list) -> None:
+    """
+    Archives prompt files, clears stages.yaml, and moves reports into output/.
+    """
+    os.makedirs(PROMPTS_ARCHIVE_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Archive prompt files used in this run
+    for stage in stages:
+        prompt_path = stage.get("prompt")
+        if not prompt_path:
+            continue
+        if not os.path.isabs(prompt_path):
+            prompt_path = os.path.join(BASE_DIR, prompt_path)
+        if not os.path.exists(prompt_path):
+            continue
+        dest = os.path.join(PROMPTS_ARCHIVE_DIR, os.path.basename(prompt_path))
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+            shutil.move(prompt_path, dest)
+            print(f"[INFO] Archived prompt: {dest}")
+        except Exception as exc:
+            print(f"[WARN] Failed to archive prompt {prompt_path}: {exc}")
+
+    # Clear stages.yaml
+    try:
+        with open(STAGES_PATH, "w", encoding="utf-8") as handle:
+            handle.write("[]\n")
+        print("[INFO] Cleared stages.yaml")
+    except Exception as exc:
+        print(f"[WARN] Failed to clear stages.yaml: {exc}")
+
+    # Move reports into output/
+    if os.path.isdir(REPORTS_DIR):
+        for root, _, files in os.walk(REPORTS_DIR):
+            rel_root = os.path.relpath(root, REPORTS_DIR)
+            for filename in files:
+                src = os.path.join(root, filename)
+                dest_dir = os.path.join(OUTPUT_DIR, rel_root) if rel_root != "." else OUTPUT_DIR
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = os.path.join(dest_dir, filename)
+                try:
+                    if os.path.exists(dest):
+                        os.remove(dest)
+                    shutil.move(src, dest)
+                    print(f"[INFO] Moved report: {dest}")
+                except Exception as exc:
+                    print(f"[WARN] Failed to move report {src}: {exc}")
 
 
 def main() -> int:
     args = parse_args()
-
-    if args.encrypt_env:
-        try:
-            encrypt_env(".env", ".env.enc", "1111")
-            print("[INFO] Encrypted .env into .env.enc using password 1111.")
-            return 0
-        except Exception as exc:
-            print(f"[ERROR] Failed to encrypt env: {exc}")
-            return 1
 
     if args.once:
         print("[INFO] --once specified; running a single pass.")
@@ -246,7 +317,7 @@ def main() -> int:
             sup_result = run_supervisor_cycle(
                 goal=args.supervisor_goal,
                 mode=args.mode or "daily",
-                project=args.project or "ai_scalper_bot",
+                project=getattr(args, "supervisor_project", None) or "ai_scalper_bot",
             )
         except Exception as exc:
             print(f"[ERROR] Supervisor run failed: {exc}")
@@ -299,11 +370,13 @@ def main() -> int:
             return 0 if result.get("status") == "ok" else 1
 
         agent = MetaAgent()
-        success = agent.run_stage_pipeline()
+        success, stages = agent.run_stage_pipeline()
     except Exception as exc:
         print(f"[ERROR] Meta-Agent failed: {exc}")
         return 1
 
+    if success:
+        cleanup_after_successful_run(stages)
     return 0 if success else 1
 
 

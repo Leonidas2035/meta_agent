@@ -1,41 +1,27 @@
 import os
-from typing import List
+from typing import List, Optional
 
-from dotenv import load_dotenv
 from openai import OpenAI
-
-from env_crypto import EnvCryptoError, load_decrypted_env
-
-
-def _bootstrap_env() -> None:
-    """
-    Prefer encrypted env, fallback to plaintext .env.
-    Does not override existing process env values.
-    """
-    decrypted_loaded = False
-    if os.path.exists(".env.enc"):
-        try:
-            load_decrypted_env()
-            decrypted_loaded = True
-        except EnvCryptoError as exc:
-            print(f"[WARN] Could not decrypt .env.enc: {exc}")
-
-    # Only override values if nothing was loaded yet.
-    load_dotenv(override=not decrypted_loaded)
 
 
 class CodexClient:
-    def __init__(self):
-        _bootstrap_env()
+    def __init__(self, mode: Optional[str] = None):
+        # Determine mode: env has priority, then provided arg, default dev
+        env_mode = os.getenv("META_AGENT_MODE")
+        resolved_mode = (env_mode or mode or "dev").strip().lower()
+        if resolved_mode not in {"dev", "prod"}:
+            resolved_mode = "dev"
+        self.mode = resolved_mode
 
-        self.api_key = os.getenv("OPENAI_API_KEY")
+        env_key_name = f"OPENAI_API_KEY_{self.mode.upper()}"
+        self.api_key = os.getenv(env_key_name)
         if not self.api_key:
-            raise RuntimeError("OPENAI_API_KEY not found")
+            raise RuntimeError("API key not set in environment variables")
 
         self.client = OpenAI(api_key=self.api_key)
 
         # more stable model for long prompts
-        self.model = "gpt-4.1"   # or "gpt-5.1"
+        self.model = "gpt-4.1"
 
         # max chunk size to avoid 400 errors
         self.chunk_size = 12000
@@ -50,7 +36,6 @@ class CodexClient:
         Avoids invalid_request_error and ensures compatibility with chat models.
         """
 
-        # Build message list with chunking
         messages = [
             {
                 "role": "system",
@@ -58,7 +43,7 @@ class CodexClient:
                     "You are an autonomous code-generation and refactoring agent "
                     "inside a Meta-Agent pipeline. Follow instructions precisely, "
                     "output only code or patches when required."
-                )
+                ),
             }
         ]
 
@@ -70,7 +55,7 @@ class CodexClient:
                 model=self.model,
                 messages=messages,
                 max_tokens=4096,
-                temperature=0
+                temperature=0,
             )
 
             return response.choices[0].message.content

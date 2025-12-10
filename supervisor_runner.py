@@ -196,9 +196,14 @@ def _build_candidate_changes(task_results: List[Dict[str, Any]]) -> List[Dict[st
     for res in task_results:
         task_id = res.get("task_id")
         risks = res.get("risks") or []
+        safety_status = res.get("safety_status")
         risk_level = "low"
         if risks:
             risk_level = "medium"
+        if safety_status == "warn" and risk_level == "low":
+            risk_level = "medium"
+        if safety_status == "block":
+            risk_level = "high"
         files = (res.get("changed_files") or []) + (res.get("created_files") or [])
         for path in files:
             entry = file_map.setdefault(path, {"tasks": [], "risk_level": risk_level})
@@ -206,6 +211,8 @@ def _build_candidate_changes(task_results: List[Dict[str, Any]]) -> List[Dict[st
                 entry["tasks"].append(task_id)
             if risk_level == "medium":
                 entry["risk_level"] = "medium"
+            if risk_level == "high":
+                entry["risk_level"] = "high"
     candidate_changes = []
     for path, info in file_map.items():
         candidate_changes.append(
@@ -267,12 +274,20 @@ def write_supervisor_summary_md(summary: Dict[str, Any]) -> str:
         lines.append(f"   - Type: {task.get('task_type', '')}")
         lines.append(f"   - Priority: {task.get('priority', '')}")
         lines.append(f"   - Status: {task.get('status')}")
+        lines.append(f"   - Safety: {task.get('safety_status', 'unknown')}")
         lines.append(f"   - Changed files: {len(task.get('changed_files') or [])}")
         if task.get("risks"):
             lines.append(f"   - Risks: {len(task.get('risks'))} item(s)")
         if task.get("report_md_path"):
             lines.append(f"   - Report (MD): {task.get('report_md_path')}")
         lines.append("")
+
+    safety_overview = summary.get("safety_overview", {})
+    lines.append("## Safety Overview")
+    lines.append(f"- Tasks with warnings: {safety_overview.get('warn_tasks', 0)}")
+    lines.append(f"- Tasks blocked by safety policy: {safety_overview.get('blocked_tasks', 0)}")
+    lines.append(f"- Patch files generated: {len(safety_overview.get('patch_files') or [])}")
+    lines.append("")
 
     lines.append("## Candidate Changes")
     lines.append("")
@@ -332,6 +347,11 @@ def run_supervisor_cycle(goal: str, mode: str = "daily", project: str = "ai_scal
     status = _aggregate_status(results)
     candidate_changes = _build_candidate_changes(results)
     overall_summary = _compose_overall_summary(results, candidate_changes)
+    warn_tasks = sum(1 for r in results if r.get("safety_status") == "warn")
+    blocked_tasks = sum(1 for r in results if r.get("safety_status") == "block")
+    patch_files_all: List[str] = []
+    for r in results:
+        patch_files_all.extend(r.get("patch_files") or [])
 
     summary: Dict[str, Any] = {
         "goal": goal,
@@ -347,6 +367,11 @@ def run_supervisor_cycle(goal: str, mode: str = "daily", project: str = "ai_scal
         "tasks": results,
         "candidate_changes": candidate_changes,
         "overall_summary": overall_summary,
+        "safety_overview": {
+            "warn_tasks": warn_tasks,
+            "blocked_tasks": blocked_tasks,
+            "patch_files": patch_files_all,
+        },
         "supervisor_md_path": None,
         "supervisor_json_path": None,
     }

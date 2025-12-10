@@ -1,0 +1,9 @@
+default: ai_scalper_bot
+
+projects:
+  ai_scalper_bot:
+    path: ../ai_scalper_bot
+  meta_agent:
+    path: .
+  supervisor_agent:
+    path: ../Supervisor agent

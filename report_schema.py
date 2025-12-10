@@ -14,7 +14,7 @@ class Report:
     title: str
     priority: str = "normal"
 
-    status: str = "ok"          # "ok" | "error" | "partial"
+    status: str = "ok"          # "ok" | "error" | "partial" | "blocked"
     error_message: Optional[str] = None
 
     summary: str = ""
@@ -24,6 +24,11 @@ class Report:
 
     risks: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+
+    safety_status: str = "allow"            # "allow" | "warn" | "block"
+    blocked_files: List[str] = field(default_factory=list)
+    warning_files: List[str] = field(default_factory=list)
+    patch_files: List[str] = field(default_factory=list)
 
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -60,6 +65,7 @@ def write_md_report(report: Report) -> str:
         f"- Title: {report.title}",
         f"- Priority: {report.priority}",
         f"- Status: {report.status}",
+        f"- Safety: {report.safety_status}",
     ]
     if report.error_message:
         lines.append(f"- Error: {report.error_message}")
@@ -94,7 +100,18 @@ def write_md_report(report: Report) -> str:
         "## Deleted Files",
         *(report.deleted_files or ["- none"]),
         "",
+        "## Patch Files",
+        *(report.patch_files or ["- none"]),
+        "",
     ]
+    if report.blocked_files:
+        lines.append("## Blocked Files")
+        lines.extend(f"- {f}" for f in report.blocked_files)
+        lines.append("")
+    if report.warning_files:
+        lines.append("## Warning Files")
+        lines.extend(f"- {f}" for f in report.warning_files)
+        lines.append("")
     if report.risks:
         lines.append("## Risks")
         lines.extend(f"- {risk}" for risk in report.risks)
@@ -102,6 +119,16 @@ def write_md_report(report: Report) -> str:
     if report.notes:
         lines.append("## Notes")
         lines.extend(f"- {note}" for note in report.notes)
+        lines.append("")
+    if report.meta.get("quality_checks"):
+        qc = report.meta["quality_checks"]
+        lines.append("## Quality Checks")
+        lines.append(f"- Tests run: {qc.get('tests_run')}, status: {qc.get('tests_status')}")
+        compile_errors = qc.get("compile_errors") or {}
+        if compile_errors:
+            lines.append("- Compile errors:")
+            for path, msg in compile_errors.items():
+                lines.append(f"  - {path}: {msg}")
         lines.append("")
 
     with open(path, "w", encoding="utf-8") as handle:

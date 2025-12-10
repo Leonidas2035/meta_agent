@@ -1,3 +1,9 @@
-# secrets
-secrets.env
-*.env
+.env
+output/
+logs/
+reports/
+prompts/archive/
+patches/
+state/
+*.key
+*.pem
