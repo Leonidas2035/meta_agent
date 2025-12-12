@@ -1,173 +1,128 @@
-import datetime
+from __future__ import annotations
+
+import json
 import logging
-import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from pathlib import Path
 
-from offmarket_config import (
-    DEFAULT_CONFIG_PATH,
-    DEFAULT_STATE_PATH,
-    OffMarketConfig,
-    OffMarketScheduleItem,
-    OffMarketState,
-    is_bot_idle,
-    load_offmarket_config,
-    load_offmarket_state,
-    save_offmarket_state,
-)
-from supervisor_runner import run_supervisor_cycle
+from offmarket_state import OffmarketState, load_offmarket_state, save_offmarket_state
+from projects_config import load_project_registry
+from supervisor_runner import run_supervisor_maintenance_once
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
-
-logger = logging.getLogger(__name__)
+SCHEDULE_CFG_PATH = Path("config/offmarket_schedule.yaml")
+STATE_PATH = Path("state/offmarket_state.json")
+LOG_PATH = Path("logs/offmarket_scheduler.log")
 
 
-@dataclass
-class DueCycle:
-    goal: str
-    mode: str
-    schedule: OffMarketScheduleItem
+def _load_schedule() -> dict:
+    import yaml
+
+    if not SCHEDULE_CFG_PATH.exists():
+        return {"enabled": False}
+    with SCHEDULE_CFG_PATH.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
 
 
-def _now_in_tz(tz_name: str, now: Optional[datetime.datetime] = None) -> datetime.datetime:
-    naive_now = now or datetime.datetime.utcnow()
-    if ZoneInfo is None:
-        return naive_now
+def _setup_logging() -> logging.Logger:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("offmarket_scheduler")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+    return logger
+
+
+def _bot_idle(schedule_cfg: dict, logger: logging.Logger) -> bool:
+    if not schedule_cfg.get("require_bot_idle", True):
+        return True
+    status_file = schedule_cfg.get("bot_status_file")
+    if not status_file:
+        logger.warning("require_bot_idle enabled but bot_status_file not set; treating as busy.")
+        return False
+    path = Path(status_file)
+    if not path.exists():
+        logger.warning("bot_status_file missing: %s", path)
+        return False
     try:
-        tz = ZoneInfo(tz_name)
-        return naive_now.replace(tzinfo=datetime.timezone.utc).astimezone(tz)
-    except Exception:
-        return naive_now
+        data = json.loads(path.read_text(encoding="utf-8"))
+        is_trading = bool(data.get("is_trading", False))
+        open_positions = int(data.get("open_positions", 0))
+        return (not is_trading) and open_positions == 0
+    except Exception as exc:
+        logger.warning("Failed to read bot status: %s", exc)
+        return False
 
 
-def _day_name(dt: datetime.datetime) -> str:
-    return dt.strftime("%a")  # Mon, Tue, ...
+def _within_window(schedule_cfg: dict, now: datetime) -> bool:
+    window = schedule_cfg.get("window", {}) or {}
+    start_h = int(window.get("start_hour_utc", 0))
+    end_h = int(window.get("end_hour_utc", 24))
+    hour = now.hour
+    if start_h <= end_h:
+        return start_h <= hour < end_h
+    # wrap-around window
+    return hour >= start_h or hour < end_h
 
 
-def _parse_time_str(time_str: str) -> tuple[int, int]:
+def _day_allowed(schedule_cfg: dict, now: datetime) -> bool:
+    days = schedule_cfg.get("days", {}) or {}
+    weekday = now.weekday()  # 0=Mon
+    if weekday < 5:
+        return bool(days.get("allow_weekdays", True))
+    return bool(days.get("allow_weekends", True))
+
+
+def main() -> None:
+    schedule_cfg = _load_schedule()
+    logger = _setup_logging()
+
+    if not schedule_cfg.get("enabled", False):
+        logger.info("Offmarket scheduler disabled; exiting.")
+        return
+
+    now = datetime.now(timezone.utc)
+    state = load_offmarket_state(STATE_PATH)
+
+    if not _within_window(schedule_cfg, now):
+        logger.info("Outside allowed window; skipping.")
+        return
+    if not _day_allowed(schedule_cfg, now):
+        logger.info("Day not allowed; skipping.")
+        return
+
+    # reset runs_today if new day
+    if state.last_run_utc and state.last_run_utc.date() != now.date():
+        state.runs_today = 0
+
+    max_runs = int(schedule_cfg.get("max_runs_per_day", 1))
+    if state.runs_today >= max_runs:
+        logger.info("Run limit reached for today (%s >= %s)", state.runs_today, max_runs)
+        return
+
+    if not _bot_idle(schedule_cfg, logger):
+        logger.info("Bot not idle; skipping.")
+        return
+
+    registry = load_project_registry()
     try:
-        parts = time_str.split(":")
-        return int(parts[0]), int(parts[1])
-    except Exception:
-        return 3, 0
+        result = run_supervisor_maintenance_once(registry, schedule_cfg)
+        state.last_run_utc = now
+        state.runs_today += 1
+        state.last_run_result = result.get("status")
+        save_offmarket_state(STATE_PATH, state)
+        logger.info("Offmarket maintenance completed with status=%s", result.get("status"))
+    except Exception as exc:
+        state.last_run_utc = now
+        state.last_run_result = f"error: {exc}"
+        save_offmarket_state(STATE_PATH, state)
+        logger.error("Offmarket maintenance failed: %s", exc)
 
 
-def _reset_runs_if_new_day(state: OffMarketState, current_date: str) -> None:
-    if state.runs_date != current_date:
-        state.runs_today = {}
-        state.runs_date = current_date
-
-
-def compute_due_cycles(
-    config: OffMarketConfig,
-    state: OffMarketState,
-    now: Optional[datetime.datetime] = None,
-) -> List[DueCycle]:
-    """
-    Determines which supervisor cycles should run based on schedule, cooldown, and per-day limits.
-    """
-    current = _now_in_tz(config.timezone, now)
-    _reset_runs_if_new_day(state, current.strftime("%Y-%m-%d"))
-
-    due: List[DueCycle] = []
-    for sched in config.schedules:
-        if not sched.enabled:
-            continue
-
-        today_name = _day_name(current)
-        if sched.days != ["*"] and today_name not in sched.days:
-            continue
-
-        hour, minute = _parse_time_str(sched.time)
-        scheduled_dt = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        window_end = scheduled_dt + datetime.timedelta(minutes=sched.window_minutes)
-        if current < scheduled_dt or current > window_end:
-            continue
-
-        last_run_str = state.last_runs.get(sched.goal)
-        if last_run_str:
-            try:
-                last_run_dt = datetime.datetime.fromisoformat(last_run_str.replace("Z", "+00:00"))
-                delta_minutes = (current - last_run_dt).total_seconds() / 60
-                if delta_minutes < config.cooldown_minutes:
-                    continue
-            except Exception:
-                pass
-
-        runs_today = state.runs_today.get(sched.goal, 0)
-        if runs_today >= config.max_runs_per_day:
-            continue
-
-        due.append(DueCycle(goal=sched.goal, mode=sched.mode, schedule=sched))
-
-    return due
-
-
-def run_offmarket_maintenance_once(
-    config_path: str = DEFAULT_CONFIG_PATH,
-    state_path: str = DEFAULT_STATE_PATH,
-    now: Optional[datetime.datetime] = None,
-) -> Dict[str, Any]:
-    """
-    One-shot runner that evaluates off-market schedules and triggers supervisor cycles if due.
-    """
-    logger.info("Loading off-market config from %s", config_path)
-    config = load_offmarket_config(config_path)
-    state = load_offmarket_state(state_path)
-
-    current = _now_in_tz(config.timezone, now)
-    logger.info("Current time in %s: %s", config.timezone, current.isoformat())
-
-    if config.require_bot_idle:
-        idle = is_bot_idle(config)
-        if not idle:
-            logger.warning("Bot is not idle; skipping maintenance.")
-            return {
-                "status": "skipped",
-                "reason": "bot_not_idle",
-                "now": current.isoformat(),
-                "ran_cycles": [],
-                "results": [],
-                "config_path": config_path,
-                "state_path": state_path,
-            }
-
-    due_cycles = compute_due_cycles(config, state, current)
-    if not due_cycles:
-        logger.info("No due cycles at this time.")
-        return {
-            "status": "no_due_cycles",
-            "reason": "no_due_cycles",
-            "now": current.isoformat(),
-            "ran_cycles": [],
-            "results": [],
-            "config_path": config_path,
-            "state_path": state_path,
-        }
-
-    results = []
-    ran_cycles = []
-    for cycle in due_cycles:
-        logger.info("Running supervisor cycle: goal=%s mode=%s", cycle.goal, cycle.mode)
-        summary = run_supervisor_cycle(goal=cycle.goal, mode=cycle.mode, project=config.project)
-        results.append(summary)
-        ran_cycles.append(cycle.goal)
-        state.last_runs[cycle.goal] = current.isoformat()
-        state.runs_today[cycle.goal] = state.runs_today.get(cycle.goal, 0) + 1
-        logger.info("Supervisor cycle completed: goal=%s status=%s", cycle.goal, summary.get("status"))
-
-    save_offmarket_state(state, state_path)
-    logger.info("Saved off-market state to %s", state_path)
-
-    return {
-        "status": "ok",
-        "reason": None,
-        "now": current.isoformat(),
-        "ran_cycles": ran_cycles,
-        "results": results,
-        "config_path": config_path,
-        "state_path": state_path,
-    }
+if __name__ == "__main__":
+    main()

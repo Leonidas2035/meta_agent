@@ -1,381 +1,145 @@
+from __future__ import annotations
+
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from codex_client import CodexClient
-from meta_core import run_task
-from report_schema import REPORTS_DIR
-from task_manager import create_task
-from task_schema import Task
+import yaml
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-SUPERVISOR_REPORT_DIR = os.path.join(REPORTS_DIR, "supervisor")
+from meta_core import run_task
+from projects_config import ProjectRegistry, resolve_project_root
+from task_manager import create_task
+
+REPORTS_SUPERVISOR_DIR = Path("reports") / "supervisor"
 
 
 @dataclass
-class PlannedTask:
-    """
-    Planned task produced by the Supervisor planner before materialization.
-    """
-    task_type: str
+class BacklogItem:
+    project_id: str
     title: str
-    priority: str
-    description: str
-    details: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    instructions: str
+    severity: str  # low | normal | high
 
 
-def _ensure_supervisor_dir() -> None:
-    os.makedirs(SUPERVISOR_REPORT_DIR, exist_ok=True)
+def _load_reports(report_dir: Path) -> List[Path]:
+    if not report_dir.exists():
+        return []
+    files = []
+    for entry in report_dir.iterdir():
+        if entry.is_file() and entry.suffix.lower() in {".md", ".json"}:
+            files.append(entry)
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _extract_json_array(text: str) -> Optional[str]:
-    """
-    Finds the first JSON array in text; returns None if not found.
-    """
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start:end + 1]
+def _severity_from_name(name: str) -> str:
+    lower = name.lower()
+    if "high" in lower or "critical" in lower:
+        return "high"
+    if "low" in lower:
+        return "low"
+    return "normal"
 
 
-def _llm_client() -> CodexClient:
-    return CodexClient()
-
-
-def generate_planned_tasks_via_llm(goal: str, mode: str = "daily", project: str = "ai_scalper_bot") -> List[PlannedTask]:
-    """
-    Uses LLM to convert a high-level goal into 1-3 concrete PlannedTask objects.
-    Fallbacks to heuristic plan on errors.
-    """
-    system_message = (
-        "You are a Supervisor planner for Meta-Agent. "
-        "Given a high-level goal, produce 1-3 maintenance tasks for a trading bot project. "
-        "Return ONLY a JSON array with objects containing: task_type, title, priority, description, details. "
-        "Supported task_type values: audit_code, risk_review, retrain_model, propose_features. "
-        "Priorities: low | normal | high."
-    )
-    user_message = (
-        f"Goal: {goal}\n"
-        f"Mode: {mode}\n"
-        f"Project: {project}\n"
-        "Context: off-market maintenance; do not run live trading. "
-        "Make tasks concise and actionable. Include brief details as markdown (Objective/Tasks)."
-    )
-
+def _parse_report(path: Path) -> Dict[str, Any]:
+    if path.suffix.lower() == ".json":
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"title": path.name, "body": "", "severity": _severity_from_name(path.name)}
     try:
-        client = _llm_client()
-        response = client.client.chat.completions.create(
-            model=client.model,
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message},
-            ],
-            max_tokens=800,
-            temperature=0,
-        )
-        content = response.choices[0].message.content or ""
-        json_block = _extract_json_array(content) or content
-        parsed = json.loads(json_block)
-        if not isinstance(parsed, list) or not parsed:
-            raise ValueError("Empty or invalid plan.")
-        planned: List[PlannedTask] = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            task_type = item.get("task_type") or "propose_features"
-            title = item.get("title") or f"{task_type} for {project}"
-            priority = item.get("priority") or "normal"
-            description = item.get("description") or f"Task for goal: {goal}"
-            details = item.get("details") or "# Objective\nDescribe the task.\n"
-            planned.append(
-                PlannedTask(
-                    task_type=task_type,
-                    title=title,
-                    priority=priority,
-                    description=description,
-                    details=details,
-                    metadata=item,
-                )
-            )
-        if planned:
-            return planned[:3]
-        raise ValueError("Plan parsing yielded no tasks.")
+        text = path.read_text(encoding="utf-8")
     except Exception:
-        # Fallback heuristic plan
-        goal_lower = goal.lower()
-        fallback: List[PlannedTask] = []
-        if "audit" in goal_lower:
-            fallback.append(
-                PlannedTask(
-                    task_type="audit_code",
-                    title=f"Audit code for {project}",
-                    priority="normal",
-                    description="Quick audit of execution and risk code paths.",
-                    details="# Objective\nAudit code for regressions.\n# Tasks\n- Review core execution\n- Check risk rules\n",
-                )
-            )
-        if "retrain" in goal_lower or "train" in goal_lower:
-            fallback.append(
-                PlannedTask(
-                    task_type="retrain_model",
-                    title=f"Retrain model for {project}",
-                    priority="high",
-                    description="Retrain signal/model on latest data.",
-                    details="# Objective\nRetrain ML model.\n# Tasks\n- Load latest data\n- Train and evaluate\n- Compare to baseline\n",
-                )
-            )
-        if not fallback:
-            fallback.append(
-                PlannedTask(
-                    task_type="propose_features",
-                    title=f"Feature ideas for {project}",
-                    priority="normal",
-                    description="Brainstorm new features/experiments.",
-                    details="# Objective\nPropose features.\n# Tasks\n- List ideas with priority\n",
-                )
-            )
-        return fallback[:3]
+        return {"title": path.name, "body": "", "severity": _severity_from_name(path.name)}
+    lines = [ln.strip() for ln in text.splitlines()]
+    title = lines[0].lstrip("# ").strip() if lines else path.name
+    body = "\n".join(lines[:40])
+    return {"title": title or path.name, "body": body, "severity": _severity_from_name(path.name)}
 
 
-def materialize_planned_tasks(
-    planned_tasks: List[PlannedTask],
-    goal: str,
-    mode: str,
-    project: str = "ai_scalper_bot",
-    source: str = "supervisor",
-) -> List[Task]:
-    """
-    Converts PlannedTask objects into real Task files via task_manager.create_task.
-    """
-    tasks: List[Task] = []
-    for planned in planned_tasks:
+def _select_project_for_report(report: Dict[str, Any]) -> str:
+    title = (report.get("title") or "").lower()
+    body = (report.get("body") or "").lower()
+    if "supervisor" in title or "supervisor" in body:
+        return "supervisor_agent"
+    if "meta" in title or "meta" in body:
+        return "meta_agent"
+    return "ai_scalper_bot"
+
+
+def build_backlog_from_reports(
+    registry: ProjectRegistry,
+    max_items: int,
+    min_severity: str = "normal",
+) -> List[BacklogItem]:
+    severity_order = {"low": 0, "normal": 1, "high": 2}
+    threshold = severity_order.get(min_severity, 1)
+    backlog: List[BacklogItem] = []
+
+    reports = _load_reports(REPORTS_SUPERVISOR_DIR)
+    for rep in reports:
+        meta = _parse_report(rep)
+        sev = meta.get("severity", "normal")
+        if severity_order.get(sev, 1) < threshold:
+            continue
+        project_id = _select_project_for_report(meta)
+        if project_id not in registry.projects:
+            project_id = registry.default_project_id
+
+        instructions = (
+            "# Supervisor Report Context\n"
+            f"Source report: {rep.name}\n"
+            f"Severity: {sev}\n\n"
+            "Use the context below to propose fixes or follow-ups:\n\n"
+            f"{meta.get('body','')}\n"
+        )
+        backlog.append(
+            BacklogItem(
+                project_id=project_id,
+                title=meta.get("title", rep.stem),
+                instructions=instructions,
+                severity=sev,
+            )
+        )
+        if len(backlog) >= max_items:
+            break
+    return backlog
+
+
+def run_supervisor_maintenance_once(registry: ProjectRegistry, schedule_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    backlog_cfg = schedule_cfg.get("backlog", {}) or {}
+    max_items = int(backlog_cfg.get("max_items_per_run", 5))
+    min_sev = str(backlog_cfg.get("min_severity", "normal")).lower()
+
+    backlog = build_backlog_from_reports(registry, max_items=max_items, min_severity=min_sev)
+    if not backlog:
+        return {"status": "no_backlog", "tasks": []}
+
+    tasks_summary: List[Dict[str, Any]] = []
+    for item in backlog:
+        try:
+            project_info = resolve_project_root(item.project_id, registry)
+        except KeyError:
+            project_info = resolve_project_root(None, registry)
+
         body = (
-            "# Supervisor Goal\n"
-            f"{goal}\n\n"
-            f"Mode: {mode}\n"
-            f"Project: {project}\n\n"
-            "---\n\n"
-            "# Description\n"
-            f"{planned.description}\n\n"
-            f"{planned.details}\n"
+            f"# Supervisor Follow-up\n"
+            f"Project: {item.project_id}\n"
+            f"Severity: {item.severity}\n\n"
+            f"{item.instructions}\n"
         )
         task = create_task(
-            project=project,
-            task_type=planned.task_type,
-            title=planned.title,
+            project=item.project_id,
+            task_type="supervisor_followup",
+            title=item.title,
             body_markdown=body,
-            priority=planned.priority,
-            source=source,
+            priority="high" if item.severity == "high" else "normal",
+            source="offmarket_supervisor",
         )
-        tasks.append(task)
-    return tasks
+        result = run_task(task.task_id)
+        result["project"] = item.project_id
+        tasks_summary.append(result)
 
-
-def _aggregate_status(results: List[Dict[str, Any]]) -> str:
-    statuses = [r.get("status") for r in results]
-    if not statuses:
-        return "error"
-    if all(s == "ok" for s in statuses):
-        return "ok"
-    if any(s == "ok" for s in statuses) and any(s == "error" for s in statuses):
-        return "partial"
-    if any(s == "partial" for s in statuses):
-        return "partial"
-    return "error"
-
-
-def _build_candidate_changes(task_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Groups file changes across tasks and assigns a simple risk level.
-    """
-    file_map: Dict[str, Dict[str, Any]] = {}
-    for res in task_results:
-        task_id = res.get("task_id")
-        risks = res.get("risks") or []
-        safety_status = res.get("safety_status")
-        risk_level = "low"
-        if risks:
-            risk_level = "medium"
-        if safety_status == "warn" and risk_level == "low":
-            risk_level = "medium"
-        if safety_status == "block":
-            risk_level = "high"
-        files = (res.get("changed_files") or []) + (res.get("created_files") or [])
-        for path in files:
-            entry = file_map.setdefault(path, {"tasks": [], "risk_level": risk_level})
-            if task_id and task_id not in entry["tasks"]:
-                entry["tasks"].append(task_id)
-            if risk_level == "medium":
-                entry["risk_level"] = "medium"
-            if risk_level == "high":
-                entry["risk_level"] = "high"
-    candidate_changes = []
-    for path, info in file_map.items():
-        candidate_changes.append(
-            {
-                "file_path": path,
-                "tasks": info["tasks"],
-                "risk_level": info["risk_level"],
-                "reason": f"Modified in tasks: {', '.join(info['tasks'])}" if info["tasks"] else "Modified by supervisor tasks",
-            }
-        )
-    return candidate_changes
-
-
-def _compose_overall_summary(task_results: List[Dict[str, Any]], candidate_changes: List[Dict[str, Any]]) -> str:
-    total = len(task_results)
-    ok = sum(1 for r in task_results if r.get("status") == "ok")
-    err = sum(1 for r in task_results if r.get("status") == "error")
-    partial = sum(1 for r in task_results if r.get("status") == "partial")
-    files_changed = set()
-    for r in task_results:
-        files_changed.update(r.get("changed_files") or [])
-        files_changed.update(r.get("created_files") or [])
-    high_risk = sum(1 for c in candidate_changes if c.get("risk_level") in {"medium", "high"})
-    return (
-        f"{total} tasks executed: {ok} ok, {partial} partial, {err} error. "
-        f"{len(files_changed)} files changed. "
-        f"{high_risk} medium/high-risk changes identified."
-    )
-
-
-def write_supervisor_summary_md(summary: Dict[str, Any]) -> str:
-    """
-    Writes a Markdown supervisor summary to reports/supervisor/.
-    """
-    _ensure_supervisor_dir()
-    timestamp = summary["finished_at"].replace(":", "").replace("-", "")
-    filename = f"{summary['project']}_{summary['goal']}_{timestamp}.md"
-    path = os.path.join(SUPERVISOR_REPORT_DIR, filename)
-
-    lines: List[str] = [
-        "# Supervisor Cycle Summary",
-        "",
-        f"- Goal: {summary['goal']}",
-        f"- Mode: {summary['mode']}",
-        f"- Project: {summary['project']}",
-        f"- Status: {summary['status']}",
-        f"- Started at: {summary['started_at']}",
-        f"- Finished at: {summary['finished_at']}",
-        f"- Duration: {summary.get('duration_sec', 0)} seconds",
-        f"- Total tasks: {len(summary.get('tasks', []))}",
-        "",
-        "## Tasks",
-        "",
-    ]
-
-    for idx, task in enumerate(summary.get("tasks", []), start=1):
-        lines.append(f"{idx}. **{task.get('task_id', 'unknown')}**")
-        lines.append(f"   - Title: {task.get('title', '')}")
-        lines.append(f"   - Type: {task.get('task_type', '')}")
-        lines.append(f"   - Priority: {task.get('priority', '')}")
-        lines.append(f"   - Status: {task.get('status')}")
-        lines.append(f"   - Safety: {task.get('safety_status', 'unknown')}")
-        lines.append(f"   - Changed files: {len(task.get('changed_files') or [])}")
-        if task.get("risks"):
-            lines.append(f"   - Risks: {len(task.get('risks'))} item(s)")
-        if task.get("report_md_path"):
-            lines.append(f"   - Report (MD): {task.get('report_md_path')}")
-        lines.append("")
-
-    safety_overview = summary.get("safety_overview", {})
-    lines.append("## Safety Overview")
-    lines.append(f"- Tasks with warnings: {safety_overview.get('warn_tasks', 0)}")
-    lines.append(f"- Tasks blocked by safety policy: {safety_overview.get('blocked_tasks', 0)}")
-    lines.append(f"- Patch files generated: {len(safety_overview.get('patch_files') or [])}")
-    lines.append("")
-
-    lines.append("## Candidate Changes")
-    lines.append("")
-    if summary.get("candidate_changes"):
-        for change in summary["candidate_changes"]:
-            tasks_str = ", ".join(change.get("tasks") or [])
-            lines.append(f"- `{change.get('file_path')}` — modified in {tasks_str or 'tasks'} (risk: {change.get('risk_level')})")
-            if change.get("reason"):
-                lines.append(f"  Reason: {change.get('reason')}")
-        lines.append("")
-    else:
-        lines.append("- None")
-        lines.append("")
-
-    lines.append("## Overall Summary")
-    lines.append(summary.get("overall_summary", ""))
-    lines.append("")
-
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
-    return path
-
-
-def write_supervisor_summary_json(summary: Dict[str, Any]) -> str:
-    """
-    Writes a JSON supervisor summary to reports/supervisor/.
-    """
-    _ensure_supervisor_dir()
-    timestamp = summary["finished_at"].replace(":", "").replace("-", "")
-    filename = f"{summary['project']}_{summary['goal']}_{timestamp}.json"
-    path = os.path.join(SUPERVISOR_REPORT_DIR, filename)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=True, indent=2)
-    return path
-
-
-def run_supervisor_cycle(goal: str, mode: str = "daily", project: str = "ai_scalper_bot") -> Dict[str, Any]:
-    """
-    High-level entry point for a Supervisor cycle.
-
-    1) Plan tasks via LLM (with fallbacks).
-    2) Materialize tasks into tasks/ directory.
-    3) Execute each task via meta_core.run_task.
-    4) Aggregate results and candidate changes.
-    5) Write supervisor summary (MD + JSON) and return the summary dict.
-    """
-    started_at = datetime.utcnow().isoformat() + "Z"
-    planned = generate_planned_tasks_via_llm(goal=goal, mode=mode, project=project)
-    tasks = materialize_planned_tasks(planned, goal=goal, mode=mode, project=project)
-
-    results: List[Dict[str, Any]] = []
-    for task in tasks:
-        res = run_task(task.task_id)
-        results.append(res)
-
-    finished_at = datetime.utcnow().isoformat() + "Z"
-    status = _aggregate_status(results)
-    candidate_changes = _build_candidate_changes(results)
-    overall_summary = _compose_overall_summary(results, candidate_changes)
-    warn_tasks = sum(1 for r in results if r.get("safety_status") == "warn")
-    blocked_tasks = sum(1 for r in results if r.get("safety_status") == "block")
-    patch_files_all: List[str] = []
-    for r in results:
-        patch_files_all.extend(r.get("patch_files") or [])
-
-    summary: Dict[str, Any] = {
-        "goal": goal,
-        "mode": mode,
-        "project": project,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "duration_sec": max(
-            (datetime.fromisoformat(finished_at.replace("Z", "+00:00")) - datetime.fromisoformat(started_at.replace("Z", "+00:00"))).total_seconds(),
-            0,
-        ),
-        "status": status,
-        "tasks": results,
-        "candidate_changes": candidate_changes,
-        "overall_summary": overall_summary,
-        "safety_overview": {
-            "warn_tasks": warn_tasks,
-            "blocked_tasks": blocked_tasks,
-            "patch_files": patch_files_all,
-        },
-        "supervisor_md_path": None,
-        "supervisor_json_path": None,
-    }
-
-    summary["supervisor_md_path"] = write_supervisor_summary_md(summary)
-    summary["supervisor_json_path"] = write_supervisor_summary_json(summary)
-    return summary
+    return {"status": "ok", "tasks": tasks_summary}

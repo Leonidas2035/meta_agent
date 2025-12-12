@@ -1,11 +1,12 @@
 import os
 import subprocess
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
+from tkinter import messagebox, scrolledtext, ttk
 
 import yaml
 
 from paths import BASE_DIR, PROMPTS_DIR, STAGES_PATH
+from projects_config import load_project_registry
 
 
 def slugify(text: str) -> str:
@@ -40,6 +41,7 @@ def save_stages(stages):
 def on_add():
     task_name = entry_name.get().strip()
     task_body = text_prompt.get("1.0", tk.END).strip()
+    project_id = project_var.get().strip()
 
     if not task_name:
         messagebox.showerror("Error", "Task name is required.")
@@ -61,12 +63,7 @@ def on_add():
             f.write(task_body + "\n")
 
         rel_prompt_path = f"prompts/{filename}"
-        stages.append(
-            {
-                "name": task_name,
-                "prompt": rel_prompt_path,
-            }
-        )
+        stages.append({"name": task_name, "prompt": rel_prompt_path, "project": project_id})
         save_stages(stages)
     except Exception as e:
         messagebox.showerror("Error", f"Failed to save task: {e}")
@@ -95,11 +92,15 @@ def on_run_meta_agent():
 
 
 def main():
-    global entry_name, text_prompt
+    global entry_name, text_prompt, project_var
 
     root = tk.Tk()
     root.title("Meta-Agent GUI")
     root.geometry("700x500")
+
+    registry = load_project_registry()
+    project_var = tk.StringVar(value=registry.default_project_id)
+    project_choices = sorted(list(registry.projects.keys()))
 
     frame_top = tk.Frame(root)
     frame_top.pack(fill=tk.X, padx=10, pady=10)
@@ -109,6 +110,12 @@ def main():
 
     entry_name = tk.Entry(frame_top)
     entry_name.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+
+    lbl_project = tk.Label(frame_top, text="Project:")
+    lbl_project.pack(side=tk.LEFT, padx=(10, 0))
+
+    project_dropdown = ttk.Combobox(frame_top, textvariable=project_var, values=project_choices, width=20)
+    project_dropdown.pack(side=tk.LEFT, padx=(5, 0))
 
     lbl_prompt = tk.Label(root, text="Task prompt / instructions (.md):")
     lbl_prompt.pack(anchor="w", padx=10)

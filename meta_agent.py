@@ -3,7 +3,7 @@ import json
 import os
 import shutil
 import sys
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import yaml
 
@@ -120,7 +120,7 @@ class MetaAgent:
             print(f"[ERROR] Failed to parse stages file: {exc}")
             return []
 
-    def run_stage_pipeline(self) -> tuple[bool, list]:
+    def run_stage_pipeline(self, override_project_id: Optional[str] = None) -> tuple[bool, list]:
         print("[INFO] Starting stage pipeline from stages.yaml...")
         stages = self._load_stages()
         if not stages:
@@ -128,7 +128,6 @@ class MetaAgent:
             return False, []
 
         default_project_id = self.project_registry.default_project_id
-        file_manager = FileManager(base_output_dir=OUTPUT_DIR, target_project=None, mode="readonly")
         for stage in stages:
             name = stage.get("name", "unnamed_stage")
             prompt_file = stage.get("prompt")
@@ -136,7 +135,7 @@ class MetaAgent:
                 print(f"[ERROR] Stage {name} is missing a prompt path.")
                 return False, stages
 
-            project_id = stage.get("project") or default_project_id
+            project_id = override_project_id or stage.get("project") or default_project_id
             try:
                 project_info = resolve_project_root(project_id, self.project_registry)
             except KeyError as exc:
@@ -177,6 +176,7 @@ class MetaAgent:
                         "mode": "legacy",
                         "target_project": target_project,
                         "project_id": project_id,
+                        "project_path": target_project,
                     },
                 )
 
@@ -188,6 +188,7 @@ class MetaAgent:
                     print(f"[ERROR] Codex call failed for stage {name}: {response}")
                     return False, stages
 
+                file_manager = FileManager(base_output_dir=OUTPUT_DIR, target_project=str(target_project), mode="write_dev")
                 file_manager.process_output(response)
                 print(f"[INFO] Stage {name} completed.")
             except Exception as exc:
@@ -231,10 +232,12 @@ def parse_args():
     parser.add_argument("--task-id", dest="task_id", help="Task ID to resolve in tasks/<ID>.md for task mode.")
     parser.add_argument("--task-file", dest="task_file", help="Alias for --task (legacy).")
     parser.add_argument("--list-tasks", action="store_true", help="List available tasks from tasks/ directory.")
+    parser.add_argument("--list-projects", action="store_true", help="List configured projects.")
     parser.add_argument("--project", dest="filter_project", help="Filter tasks by project when listing.")
     parser.add_argument("--task-type", dest="filter_task_type", help="Filter tasks by task type when listing.")
     parser.add_argument("--supervisor-goal", dest="supervisor_goal", help="Run a supervisor goal (high-level string).")
     parser.add_argument("--supervisor-project", dest="supervisor_project", help="Project root for supervisor goal runs.", default="ai_scalper_bot")
+    parser.add_argument("--project-id", dest="stage_project_id", help="Override project id for stage pipeline.")
     parser.add_argument("--once", action="store_true", help="Run once and exit (default behavior).")
     return parser.parse_args()
 
@@ -295,6 +298,14 @@ def main() -> int:
 
     if args.once:
         print("[INFO] --once specified; running a single pass.")
+
+    if args.list_projects:
+        registry = load_project_registry()
+        print("Configured projects:")
+        for pid, info in registry.projects.items():
+            prefix = "(default) " if pid == registry.default_project_id else ""
+            print(f"- {prefix}{pid}: {info.root_path} - {info.description}")
+        return 0
 
     if args.list_tasks:
         try:
@@ -370,7 +381,7 @@ def main() -> int:
             return 0 if result.get("status") == "ok" else 1
 
         agent = MetaAgent()
-        success, stages = agent.run_stage_pipeline()
+        success, stages = agent.run_stage_pipeline(override_project_id=args.stage_project_id)
     except Exception as exc:
         print(f"[ERROR] Meta-Agent failed: {exc}")
         return 1
